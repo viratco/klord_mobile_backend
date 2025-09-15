@@ -1,0 +1,97 @@
+import path from 'path';
+import fs from 'fs/promises';
+import { fileURLToPath } from 'url';
+
+export type CertificateData = {
+  leadId: string;
+  customerName: string;
+  projectType: string;
+  sizedKW: number;
+  installDate: string; // formatted date string
+  location: string;
+  certificateId: string; // generated unique id for display
+};
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+export async function generateCertificatePDF(data: CertificateData): Promise<{ filePath: string; publicUrl: string; }> {
+  // Lazy import puppeteer so server can start even if puppeteer isn't available yet
+  const { default: puppeteer } = await import('puppeteer');
+  // Load template
+  const templatePath = path.join(__dirname, '..', 'templates', 'certificate.html');
+  let html = await fs.readFile(templatePath, 'utf-8');
+
+  // Resolve background image path and embed as data URL to ensure Puppeteer loads it reliably
+  const defaultBg = path.join(__dirname, '..', 'templates', 'assets', 'certificate-bg.jpg');
+  const envBg = process.env.CERTIFICATE_BG_PATH && String(process.env.CERTIFICATE_BG_PATH).trim();
+  const bgPath = envBg && envBg.length > 0 ? path.resolve(envBg) : defaultBg;
+  try {
+    const imgBuf = await fs.readFile(bgPath);
+    const ext = (path.extname(bgPath) || '.jpg').toLowerCase();
+    const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : ext === '.svg' ? 'image/svg+xml' : 'image/jpeg';
+    const dataUrl = `data:${mime};base64,${imgBuf.toString('base64')}`;
+    html = replaceAll(html, '__BG_DATA_URL__', dataUrl);
+    // Debug: note data URL size
+    console.log(`[certificate] Using background ${bgPath} (${mime}), dataUrl length=${dataUrl.length}`);
+  } catch {
+    // Fallback: no background if read fails
+    html = replaceAll(html, '__BG_DATA_URL__', '');
+    console.warn(`[certificate] Failed to read CERTIFICATE_BG_PATH: ${bgPath}. Proceeding without background.`);
+  }
+
+  // Replace placeholders
+  html = replaceAll(html, '{{customerName}}', escapeHtml(data.customerName));
+  html = replaceAll(html, '{{projectType}}', escapeHtml(data.projectType));
+  html = replaceAll(html, '{{sizedKW}}', String(data.sizedKW));
+  html = replaceAll(html, '{{installDate}}', escapeHtml(data.installDate));
+  html = replaceAll(html, '{{location}}', escapeHtml(data.location));
+  html = replaceAll(html, '{{certificateId}}', escapeHtml(data.certificateId));
+
+  // Ensure uploads dir exists (relative to project root)
+  const uploadsDir = path.join(process.cwd(), 'uploads');
+  await fs.mkdir(uploadsDir, { recursive: true });
+
+  const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.pdf`;
+  const outPath = path.join(uploadsDir, filename);
+  const publicUrl = `/uploads/${filename}`;
+
+  // Write debug HTML alongside the PDF for inspection
+  const debugHtmlPath = path.join(uploadsDir, `${filename.replace(/\.pdf$/, '')}.html`);
+  await fs.writeFile(debugHtmlPath, html, 'utf-8');
+  console.log(`[certificate] Debug HTML written to ${debugHtmlPath}`);
+
+  // Render with puppeteer
+  const browser = await puppeteer.launch({
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+  try {
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'networkidle0' });
+    await page.pdf({
+      path: outPath,
+      format: 'A4',
+      printBackground: true,
+      margin: { top: '0mm', bottom: '0mm', left: '0mm', right: '0mm' },
+      preferCSSPageSize: true,
+    });
+  } finally {
+    await browser.close();
+  }
+
+  return { filePath: outPath, publicUrl };
+}
+
+function replaceAll(input: string, search: string, replacement: string): string {
+  const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return input.replace(new RegExp(escaped, 'g'), replacement);
+}
+
+function escapeHtml(input: string): string {
+  return input
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}

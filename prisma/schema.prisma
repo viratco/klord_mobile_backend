@@ -1,0 +1,118 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model AmcRequest {
+  id         String    @id @default(cuid())
+  leadId     String
+  customerId String
+  status     AmcStatus @default(pending)
+  note       String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  resolvedAt DateTime?
+  customer   Customer  @relation(fields: [customerId], references: [id])
+  lead       Lead      @relation(fields: [leadId], references: [id])
+
+  @@index([leadId])
+  @@index([customerId])
+}
+
+model Customer {
+  id          String       @id @default(cuid())
+  mobile      String       @unique
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  amcRequests AmcRequest[]
+  leads       Lead[]
+}
+
+model Partner {
+  id          String   @id @default(cuid())
+  mobile      String   @unique
+  name        String
+  companyName String?
+  email       String?  @unique
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Admin {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  posts        Post[]
+}
+
+model Post {
+  id        String   @id @default(cuid())
+  caption   String
+  imageUrl  String
+  likes     Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  authorId  String?
+  author    Admin?   @relation(fields: [authorId], references: [id])
+}
+
+model Lead {
+  id                     String       @id @default(cuid())
+  customerId             String?
+  projectType            String
+  sizedKW                Float
+  monthlyBill            Int
+  pincode                String
+  brand                  String
+  withSubsidy            Boolean      @default(true)
+  estimateINR            Int
+  wp                     Int?
+  plates                 Int?
+  fullName               String
+  phone                  String
+  address                String
+  street                 String
+  state                  String
+  city                   String
+  country                String
+  zip                    String
+  createdAt              DateTime     @default(now())
+  updatedAt              DateTime     @updatedAt
+  certificateUrl         String?
+  certificateGeneratedAt DateTime?
+  amcRequests            AmcRequest[]
+  customer               Customer?    @relation(fields: [customerId], references: [id])
+  steps                  LeadStep[]
+
+  @@index([customerId])
+  @@index([pincode])
+}
+
+model LeadStep {
+  id          String    @id @default(cuid())
+  leadId      String
+  name        String
+  order       Int
+  completed   Boolean   @default(false)
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  lead        Lead      @relation(fields: [leadId], references: [id])
+
+  @@unique([leadId, order])
+  @@index([leadId])
+}
+
+enum AmcStatus {
+  pending
+  in_progress
+  resolved
+  rejected
+}
