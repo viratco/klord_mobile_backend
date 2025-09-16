@@ -3,3 +3,9 @@ node_modules/
 .dist/
 dist/
 .prisma/
+
+# Local env overrides
+.env.local
+
+# Uploaded assets (served statically by Express)
+uploads/

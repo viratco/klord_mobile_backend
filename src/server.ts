@@ -1,7 +1,6 @@
 import dotenv from 'dotenv';
-// Load default .env then override with .env.local if present
+// Load only .env
 dotenv.config();
-dotenv.config({ path: '.env.local', override: true });
 import express, { Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
@@ -13,6 +12,8 @@ import bcrypt from 'bcrypt';
 import { protect, AuthenticatedRequest } from './middleware/auth.js';
 import { sendOTP } from './services/otpService.js';
 import { generateCertificatePDF } from './services/certificateService.js';
+import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 const app = express();
 const prisma = new PrismaClient();
@@ -26,16 +27,50 @@ const uploadsDir = path.join(process.cwd(), 'uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
-const storage = multer.diskStorage({
-  destination: (_req: Request, _file: any, cb: (err: any, dest: string) => void) => {
-    cb(null, uploadsDir);
-  },
-  filename: (_req: Request, file: any, cb: (err: any, filename: string) => void) => {
-    const unique = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    const ext = path.extname(file.originalname) || '.jpg';
-    cb(null, `${unique}${ext}`);
-  },
-});
+
+async function signIfS3Url(url: string): Promise<string> {
+  const key = getS3KeyFromUrl(url);
+  if (key && AWS_S3_BUCKET) {
+    try {
+      const cmd = new GetObjectCommand({ Bucket: AWS_S3_BUCKET, Key: key });
+      // 1 hour expiry is fine for feed images; adjust as needed
+      return await getSignedUrl(s3, cmd, { expiresIn: 3600 });
+    } catch (e) {
+      console.warn('[s3] failed to sign url for', key, e);
+      return url; // fall back to original url
+    }
+  }
+  return url;
+}
+
+// Use memory storage for images that will be sent to S3
+const storage = multer.memoryStorage();
+
+// S3 client configuration
+const AWS_REGION = process.env.AWS_REGION || 'ap-south-1';
+const AWS_S3_BUCKET = process.env.AWS_S3_BUCKET || '';
+const s3 = new S3Client({ region: AWS_REGION });
+
+function buildS3PublicUrl(key: string): string {
+  const bucket = AWS_S3_BUCKET;
+  const region = AWS_REGION;
+  // Standard virtual-hosted–style URL
+  return `https://${bucket}.s3.${region}.amazonaws.com/${encodeURIComponent(key)}`;
+}
+
+function getS3KeyFromUrl(url: string): string | null {
+  try {
+    const u = new URL(url.startsWith('http') ? url : `https://dummy${url}`);
+    const host = u.host;
+    if (host.includes(`${AWS_S3_BUCKET}.s3.`)) {
+      // Real S3 URL: path starts with '/<key>'
+      return decodeURIComponent(u.pathname.replace(/^\//, ''));
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 // Admin: force regenerate certificate for a lead
 app.post('/api/admin/leads/:id/certificate/regenerate', protect, async (req: AuthenticatedRequest, res: Response) => {
@@ -63,7 +98,7 @@ app.post('/api/admin/leads/:id/certificate/regenerate', protect, async (req: Aut
       certificateId,
     });
     await (prisma as any).lead.update({ where: { id }, data: { certificateUrl: publicUrl, certificateGeneratedAt: new Date() } });
-    res.json({ ok: true, certificateUrl: publicUrl });
+    res.json({ ok: true, certificateUrl: await signIfS3Url(publicUrl) });
   } catch (err) {
     console.error('[certificate] force regenerate failed', err);
     res.status(500).json({ error: 'Internal Server Error' });
@@ -97,6 +132,24 @@ app.get('/api/health', (_req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
+// Admin: list customer phone numbers (minimal payload)
+app.get('/api/admin/customers/phones', protect, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (req.user?.type !== 'admin') return res.status(403).json({ error: 'Forbidden' });
+    // Customer model has no 'name' field in schema; only return id+mobile
+    const customers = await (prisma as any).customer.findMany({
+      select: { id: true, mobile: true },
+      orderBy: { createdAt: 'desc' },
+    });
+    // Add a derived 'name' for UI compatibility (use mobile as display)
+    const shaped = customers.map((c: any) => ({ id: c.id, mobile: c.mobile, name: c.mobile }));
+    res.json(shaped);
+  } catch (err) {
+    console.error('[admin] list customer phones failed', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
 // Public sample certificate generator (for quick testing only)
 app.post('/api/sample/certificate', async (_req: Request, res: Response) => {
   try {
@@ -112,7 +165,7 @@ app.post('/api/sample/certificate', async (_req: Request, res: Response) => {
       certificateId: `SAMPLE-${now.getTime().toString().slice(-6)}`,
     };
     const { publicUrl } = await generateCertificatePDF(sample as any);
-    return res.json({ ok: true, certificateUrl: publicUrl });
+    return res.json({ ok: true, certificateUrl: await signIfS3Url(publicUrl) });
   } catch (err) {
     console.error('[certificate] sample generation failed', err);
     return res.status(500).json({ error: 'Failed to generate sample' });
@@ -167,7 +220,11 @@ app.get('/api/customer/leads', protect, async (req: AuthenticatedRequest, res: R
   try {
     if (req.user?.type !== 'customer') return res.status(403).json({ error: 'Forbidden' });
     const items = await (prisma as any).lead.findMany({ where: { customerId: req.user.sub }, orderBy: { createdAt: 'desc' } });
-    res.json(items);
+    const withSigned = await Promise.all(items.map(async (l: any) => ({
+      ...l,
+      certificateUrl: typeof l.certificateUrl === 'string' ? await signIfS3Url(l.certificateUrl) : l.certificateUrl,
+    })));
+    res.json(withSigned);
   } catch (err) {
     console.error('[leads] customer list failed', err);
     res.status(500).json({ error: 'Internal Server Error' });
@@ -181,7 +238,8 @@ app.get('/api/customer/leads/:id', protect, async (req: AuthenticatedRequest, re
     const { id } = req.params;
     const lead = await (prisma as any).lead.findFirst({ where: { id, customerId: req.user.sub } });
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
-    res.json(lead);
+    const signed = { ...lead, certificateUrl: typeof lead.certificateUrl === 'string' ? await signIfS3Url(lead.certificateUrl) : lead.certificateUrl };
+    res.json(signed);
   } catch (err) {
     console.error('[leads] customer get failed', err);
     res.status(500).json({ error: 'Internal Server Error' });
@@ -193,7 +251,11 @@ app.get('/api/admin/leads', protect, async (req: AuthenticatedRequest, res: Resp
   try {
     if (req.user?.type !== 'admin') return res.status(403).json({ error: 'Forbidden' });
     const items = await (prisma as any).lead.findMany({ orderBy: { createdAt: 'desc' }, include: { customer: true } });
-    res.json(items);
+    const withSigned = await Promise.all(items.map(async (l: any) => ({
+      ...l,
+      certificateUrl: typeof l.certificateUrl === 'string' ? await signIfS3Url(l.certificateUrl) : l.certificateUrl,
+    })));
+    res.json(withSigned);
   } catch (err) {
     console.error('[leads] admin list failed', err);
     res.status(500).json({ error: 'Internal Server Error' });
@@ -222,7 +284,8 @@ app.get('/api/admin/leads/:id', protect, async (req: AuthenticatedRequest, res: 
     const { id } = req.params;
     const lead = await (prisma as any).lead.findUnique({ where: { id }, include: { customer: true, steps: { orderBy: { order: 'asc' } } } });
     if (!lead) return res.status(404).json({ error: 'Not found' });
-    res.json(lead);
+    const signed = { ...lead, certificateUrl: typeof lead.certificateUrl === 'string' ? await signIfS3Url(lead.certificateUrl) : lead.certificateUrl };
+    res.json(signed);
   } catch (err) {
     console.error('[leads] admin get failed', err);
     res.status(500).json({ error: 'Internal Server Error' });
@@ -665,9 +728,29 @@ app.post('/api/auth/verify-otp', async (req: Request, res: Response) => {
 app.get('/api/posts', async (_req: Request, res: Response) => {
   try {
     const items = await (prisma as any).post.findMany({ orderBy: { createdAt: 'desc' } });
-    res.json(items);
+    const withSigned = await Promise.all(items.map(async (p: any) => ({
+      ...p,
+      imageUrl: typeof p.imageUrl === 'string' ? await signIfS3Url(p.imageUrl) : p.imageUrl,
+    })));
+    res.json(withSigned);
   } catch (err) {
     console.error('[posts] list failed', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Admin: list posts (protected)
+app.get('/api/admin/posts', protect, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (req.user?.type !== 'admin') return res.status(403).json({ error: 'Forbidden' });
+    const items = await (prisma as any).post.findMany({ orderBy: { createdAt: 'desc' } });
+    const withSigned = await Promise.all(items.map(async (p: any) => ({
+      ...p,
+      imageUrl: typeof p.imageUrl === 'string' ? await signIfS3Url(p.imageUrl) : p.imageUrl,
+    })));
+    res.json(withSigned);
+  } catch (err) {
+    console.error('[posts] admin list failed', err);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
@@ -686,17 +769,78 @@ app.post('/api/admin/posts', protect, upload.single('image'), async (req: Authen
     if (!file) {
       return res.status(400).json({ error: 'image file is required' });
     }
-    const publicPath = `/uploads/${file.filename}`;
+    let imageUrl: string | null = null;
+    if (AWS_S3_BUCKET) {
+      // Upload to S3
+      const ext = path.extname(file.originalname) || '.jpg';
+      const key = `posts/${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+      await s3.send(new PutObjectCommand({
+        Bucket: AWS_S3_BUCKET,
+        Key: key,
+        Body: file.buffer,
+        ContentType: file.mimetype || 'application/octet-stream',
+      }));
+      imageUrl = buildS3PublicUrl(key);
+    } else {
+      // Fallback to local disk if bucket not configured
+      const localName = `${Date.now()}-${Math.round(Math.random() * 1e9)}${path.extname(file.originalname) || '.jpg'}`;
+      const localPath = path.join(uploadsDir, localName);
+      fs.writeFileSync(localPath, file.buffer);
+      imageUrl = `/uploads/${localName}`;
+    }
+
     const post = await (prisma as any).post.create({
       data: {
         caption: caption.trim(),
-        imageUrl: publicPath,
+        imageUrl,
         authorId: req.user.sub,
       },
     });
-    res.status(201).json(post);
+    const signed = { ...post, imageUrl: imageUrl ? await signIfS3Url(imageUrl) : imageUrl };
+    res.status(201).json(signed);
   } catch (err) {
     console.error('[posts] create failed', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Admin: delete a post (and its image file if present)
+app.delete('/api/admin/posts/:id', protect, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (req.user?.type !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden: admins only' });
+    }
+    const { id } = req.params;
+    const existing = await (prisma as any).post.findUnique({ where: { id } });
+    if (!existing) return res.status(404).json({ error: 'Post not found', id });
+
+    // Attempt to delete the file from S3 if it points to our bucket; otherwise try local
+    const img: string = existing.imageUrl || '';
+    let deleted = false;
+    if (typeof img === 'string') {
+      const key = getS3KeyFromUrl(img);
+      if (key && AWS_S3_BUCKET) {
+        try {
+          await s3.send(new DeleteObjectCommand({ Bucket: AWS_S3_BUCKET, Key: key }));
+          deleted = true;
+        } catch (e) {
+          console.warn('[posts] failed to remove S3 object', e);
+        }
+      }
+      if (!deleted && img.startsWith('/uploads/')) {
+        const filePath = path.join(process.cwd(), img.replace(/^\//, ''));
+        try {
+          if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        } catch (e) {
+          console.warn('[posts] failed to remove local image file', e);
+        }
+      }
+    }
+
+    await (prisma as any).post.delete({ where: { id } });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[posts] delete failed', err);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });

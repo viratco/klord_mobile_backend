@@ -1,6 +1,7 @@
 import path from 'path';
 import fs from 'fs/promises';
 import { fileURLToPath } from 'url';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 
 export type CertificateData = {
   leadId: string;
@@ -54,7 +55,7 @@ export async function generateCertificatePDF(data: CertificateData): Promise<{ f
 
   const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.pdf`;
   const outPath = path.join(uploadsDir, filename);
-  const publicUrl = `/uploads/${filename}`;
+  let publicUrl = `/uploads/${filename}`;
 
   // Write debug HTML alongside the PDF for inspection
   const debugHtmlPath = path.join(uploadsDir, `${filename.replace(/\.pdf$/, '')}.html`);
@@ -77,6 +78,24 @@ export async function generateCertificatePDF(data: CertificateData): Promise<{ f
     });
   } finally {
     await browser.close();
+  }
+
+  // If S3 is configured, upload the PDF and return the S3 URL
+  const AWS_REGION = process.env.AWS_REGION || 'ap-south-1';
+  const AWS_S3_BUCKET = process.env.AWS_S3_BUCKET || '';
+  if (AWS_S3_BUCKET) {
+    const s3 = new S3Client({ region: AWS_REGION });
+    const key = `certificates/${filename}`;
+    const buf = await (await import('fs')).promises.readFile(outPath);
+    await s3.send(new PutObjectCommand({
+      Bucket: AWS_S3_BUCKET,
+      Key: key,
+      Body: buf,
+      ContentType: 'application/pdf',
+    }));
+    // Remove local PDF after successful upload (keep debug HTML for inspection)
+    await fs.unlink(outPath).catch(() => {});
+    publicUrl = `https://${AWS_S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${encodeURIComponent(key)}`;
   }
 
   return { filePath: outPath, publicUrl };
