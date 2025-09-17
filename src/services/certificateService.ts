@@ -19,12 +19,22 @@ const __dirname = path.dirname(__filename);
 export async function generateCertificatePDF(data: CertificateData): Promise<{ filePath: string; publicUrl: string; }> {
   // Lazy import puppeteer so server can start even if puppeteer isn't available yet
   const { default: puppeteer } = await import('puppeteer');
-  // Load template
-  const templatePath = path.join(__dirname, '..', 'templates', 'certificate.html');
-  let html = await fs.readFile(templatePath, 'utf-8');
+  // Load template (support running from dist/ or directly from src/)
+  const distTemplatePath = path.join(__dirname, '..', 'templates', 'certificate.html');
+  const srcTemplatePath = path.join(process.cwd(), 'src', 'templates', 'certificate.html');
+  const templatePath = await fileExists(distTemplatePath) ? distTemplatePath : srcTemplatePath;
+  let html: string;
+  try {
+    html = await fs.readFile(templatePath, 'utf-8');
+  } catch (e) {
+    console.error('[certificate] Failed to read template at', templatePath, e);
+    throw new Error('template_read_failed');
+  }
 
   // Resolve background image path and embed as data URL to ensure Puppeteer loads it reliably
-  const defaultBg = path.join(__dirname, '..', 'templates', 'assets', 'certificate-bg.jpg');
+  const distDefaultBg = path.join(__dirname, '..', 'templates', 'assets', 'certificate-bg.jpg');
+  const srcDefaultBg = path.join(process.cwd(), 'src', 'templates', 'assets', 'certificate-bg.jpg');
+  const defaultBg = (await fileExists(distDefaultBg)) ? distDefaultBg : srcDefaultBg;
   const envBg = process.env.CERTIFICATE_BG_PATH && String(process.env.CERTIFICATE_BG_PATH).trim();
   const bgPath = envBg && envBg.length > 0 ? path.resolve(envBg) : defaultBg;
   try {
@@ -35,10 +45,10 @@ export async function generateCertificatePDF(data: CertificateData): Promise<{ f
     html = replaceAll(html, '__BG_DATA_URL__', dataUrl);
     // Debug: note data URL size
     console.log(`[certificate] Using background ${bgPath} (${mime}), dataUrl length=${dataUrl.length}`);
-  } catch {
+  } catch (err) {
     // Fallback: no background if read fails
     html = replaceAll(html, '__BG_DATA_URL__', '');
-    console.warn(`[certificate] Failed to read CERTIFICATE_BG_PATH: ${bgPath}. Proceeding without background.`);
+    console.warn(`[certificate] Failed to read CERTIFICATE_BG_PATH: ${bgPath}. Proceeding without background.`, err);
   }
 
   // Replace placeholders
@@ -113,4 +123,13 @@ function escapeHtml(input: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;');
+}
+
+async function fileExists(p: string): Promise<boolean> {
+  try {
+    await fs.access(p as any);
+    return true;
+  } catch {
+    return false;
+  }
 }

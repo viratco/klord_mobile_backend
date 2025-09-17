@@ -119,6 +119,9 @@ import { JWT_SECRET } from './config.js';
 
 // Twilio toggle
 const TWILIO_ENABLED = String(process.env.TWILIO_ENABLED || 'false').toLowerCase() === 'true';
+// If true, when SMS sending fails we will fall back to returning the OTP in the response (DEV behavior).
+// In production set this to false to avoid exposing OTPs when Twilio fails.
+const ALLOW_DEV_OTP = String(process.env.ALLOW_DEV_OTP || 'false').toLowerCase() === 'true';
 
 function toE164(mobile: string, defaultCountry = '+91'): string {
   const trimmed = (mobile || '').replace(/\s+/g, '');
@@ -341,16 +344,17 @@ app.patch('/api/admin/leads/:id/steps/:stepId', protect, async (req: Authenticat
       data: { completed: Boolean(completed), completedAt: completed ? new Date() : null },
     });
 
-    // If marking as completed, check if all steps are done and generate certificate if missing
+    // If marking as completed, check if all non-'certificate' steps are done and generate certificate if missing
     if (Boolean(completed)) {
       const lead = await (prisma as any).lead.findUnique({ where: { id }, include: { steps: true } });
       if (lead) {
-        const steps = await (prisma as any).leadStep.findMany({ where: { leadId: id } });
-        const allComplete = steps.length > 0 && steps.every((s: any) => s.completed);
-        if (allComplete && !lead.certificateUrl) {
-          // Determine installation date as the latest completedAt among steps or now
-          const latestCompletedAt = steps
-            .map((s: any) => s.completedAt ? new Date(s.completedAt) : null)
+        const steps = await (prisma as any).leadStep.findMany({ where: { leadId: id }, orderBy: { order: 'asc' } });
+        const nonCertSteps = steps.filter((s: any) => s.name !== 'certificate');
+        const allNonCertComplete = nonCertSteps.length > 0 && nonCertSteps.every((s: any) => s.completed);
+        if (allNonCertComplete && !lead.certificateUrl) {
+          // Determine installation date as the latest completedAt among non-certificate steps or now
+          const latestCompletedAt = nonCertSteps
+            .map((s: any) => (s.completedAt ? new Date(s.completedAt) : null))
             .filter((d: Date | null) => !!d)
             .sort((a: Date | null, b: Date | null) => (a!.getTime() - b!.getTime()))
             .pop() as Date | undefined;
@@ -371,6 +375,14 @@ app.patch('/api/admin/leads/:id/steps/:stepId', protect, async (req: Authenticat
               where: { id },
               data: { certificateUrl: publicUrl, certificateGeneratedAt: new Date() },
             });
+            // Mark the 'certificate' step as completed automatically
+            const certStep = steps.find((s: any) => s.name === 'certificate');
+            if (certStep && !certStep.completed) {
+              await (prisma as any).leadStep.update({
+                where: { id: certStep.id },
+                data: { completed: true, completedAt: new Date() },
+              });
+            }
           } catch (err) {
             console.error('[certificate] generation failed', err);
             // Do not fail the step update due to certificate issues
@@ -533,6 +545,9 @@ app.post('/api/auth/partner/request-otp', async (req: Request, res: Response) =>
     }
   } catch (err) {
     console.error('[twilio][partner] send failed, falling back to dev OTP response', err);
+    if (!ALLOW_DEV_OTP) {
+      return res.status(502).json({ error: 'Failed to send OTP via SMS. Please try again later.' });
+    }
   }
   console.log(`[request-otp-partner][DEV] OTP for ${normalizedMobile} is ${otp}`);
   return res.json({ message: 'OTP sent (DEV)', otp });
@@ -635,6 +650,9 @@ app.post('/api/auth/request-otp', async (req: Request, res: Response) => {
       }
     } catch (err) {
       console.error('[twilio][customer] send failed, falling back to dev OTP response', err);
+      if (!ALLOW_DEV_OTP) {
+        return res.status(502).json({ error: 'Failed to send OTP via SMS. Please try again later.' });
+      }
     }
     return res.json({ success: true, mobile: normalized, otp: code, ttlMs: OTP_TTL_MS, via: 'dev' });
   } catch (err) {
