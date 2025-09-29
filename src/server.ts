@@ -10,7 +10,7 @@ import { PrismaClient } from '@prisma/client';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcrypt';
 import { protect, AuthenticatedRequest } from './middleware/auth.js';
-import { sendOTP } from './services/otpService.js';
+// Twilio OTP sending removed; using console OTP for development
 import { generateCertificatePDF } from './services/certificateService.js';
 import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
@@ -19,6 +19,8 @@ const app = express();
 const prisma = new PrismaClient();
 
 app.use(cors());
+// Explicit preflight for safety (some clients are picky on mobile networks)
+app.options('*', cors());
 app.use(express.json());
 
 // File uploads setup
@@ -77,7 +79,7 @@ app.post('/api/admin/leads/:id/certificate/regenerate', protect, async (req: Aut
   try {
     if (req.user?.type !== 'admin') return res.status(403).json({ error: 'Forbidden' });
     const { id } = req.params;
-    const lead = await (prisma as any).lead.findUnique({ where: { id } });
+    const lead = await (prisma as any).booking.findUnique({ where: { id } });
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
     const steps = await (prisma as any).leadStep.findMany({ where: { leadId: id } });
     const latestCompletedAt = steps
@@ -97,11 +99,340 @@ app.post('/api/admin/leads/:id/certificate/regenerate', protect, async (req: Aut
       location,
       certificateId,
     });
-    await (prisma as any).lead.update({ where: { id }, data: { certificateUrl: publicUrl, certificateGeneratedAt: new Date() } });
+    await (prisma as any).booking.update({ where: { id }, data: { certificateUrl: publicUrl, certificateGeneratedAt: new Date() } });
     res.json({ ok: true, certificateUrl: await signIfS3Url(publicUrl) });
   } catch (err) {
     console.error('[certificate] force regenerate failed', err);
     res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+
+// --- Staff Auth Endpoints ---
+app.post('/api/auth/staff/login', async (req: Request, res: Response) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password are required' });
+  }
+
+  try {
+    const staff = await prisma.staff.findUnique({ where: { email } });
+
+    if (!staff) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const isPasswordValid = await bcrypt.compare(password, staff.passwordHash);
+    if (!isPasswordValid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const token = jwt.sign({ sub: staff.id, email: staff.email, type: 'staff' }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: { id: staff.id, email: staff.email, name: staff.name, type: 'staff' } });
+  } catch (error) {
+    console.error('[staff-login] Error:', error);
+    res.status(500).json({ error: 'An internal server error occurred' });
+  }
+});
+
+// Admin: Register new staff member
+app.post('/api/admin/staff/register', protect, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (req.user?.type !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden: Admin access required' });
+    }
+
+    const { name, email, password, phone } = req.body;
+
+    // Validate required fields
+    if (!name || !email || !password || !phone) {
+      return res.status(400).json({ error: 'Name, email, password, and phone are required' });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+
+    // Validate password strength
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters long' });
+    }
+
+    // Check if staff with email already exists
+    const existingStaff = await prisma.staff.findUnique({ where: { email } });
+    if (existingStaff) {
+      return res.status(409).json({ error: 'Staff member with this email already exists' });
+    }
+
+    // Hash password
+    const saltRounds = 12;
+    const passwordHash = await bcrypt.hash(password, saltRounds);
+
+    // Create staff member
+    const staff = await prisma.staff.create({
+      data: {
+        name: name.trim(),
+        email: email.trim().toLowerCase(),
+        passwordHash,
+        phone: phone.trim(),
+      },
+    });
+
+    // Return staff data (without password hash)
+    res.status(201).json({
+      id: staff.id,
+      name: staff.name,
+      email: staff.email,
+      phone: staff.phone,
+      createdAt: staff.createdAt,
+    });
+  } catch (error) {
+    console.error('[admin-staff-register] Error:', error);
+    res.status(500).json({ error: 'An internal server error occurred' });
+  }
+});
+
+// Admin: Get all staff members
+app.get('/api/admin/staff', protect, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (req.user?.type !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden: Admin access required' });
+    }
+
+    const staff = await prisma.staff.findMany({
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        phone: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+
+    res.json(staff);
+  } catch (error) {
+    console.error('[admin-staff-list] Error:', error);
+    res.status(500).json({ error: 'An internal server error occurred' });
+  }
+});
+
+// Admin: Assign staff to booking
+app.post('/api/admin/leads/:id/assign', protect, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (req.user?.type !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden: Admin access required' });
+    }
+
+    const { id } = req.params;
+    const { staffId } = req.body;
+
+    if (!staffId) {
+      return res.status(400).json({ error: 'Staff ID is required' });
+    }
+
+    // Verify staff exists
+    const staff = await prisma.staff.findUnique({ where: { id: staffId } });
+    if (!staff) {
+      return res.status(404).json({ error: 'Staff member not found' });
+    }
+
+    // Update booking assignment
+    const updatedBooking = await prisma.booking.update({
+      where: { id },
+      data: {
+        assignedStaffId: staffId,
+        assigned: true,
+      },
+      include: {
+        assignedStaff: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+          },
+        },
+      },
+    });
+
+    res.json({
+      success: true,
+      assignedStaff: updatedBooking.assignedStaff,
+    });
+  } catch (error) {
+    console.error('[admin-assign-staff] Error:', error);
+    res.status(500).json({ error: 'An internal server error occurred' });
+  }
+});
+
+// Admin: Unassign staff from booking
+app.post('/api/admin/leads/:id/unassign', protect, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (req.user?.type !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden: Admin access required' });
+    }
+
+    const { id } = req.params;
+
+    // Update booking to remove assignment
+    const updatedBooking = await prisma.booking.update({
+      where: { id },
+      data: {
+        assignedStaffId: null,
+        assigned: false,
+      },
+    });
+
+    res.json({
+      success: true,
+      message: 'Staff assignment removed successfully',
+    });
+  } catch (error) {
+    console.error('[admin-unassign-staff] Error:', error);
+    res.status(500).json({ error: 'An internal server error occurred' });
+  }
+});
+
+// Staff: get my assigned bookings
+app.get('/api/staff/my-leads', protect, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (req.user?.type !== 'staff') {
+      return res.status(403).json({ error: 'Forbidden: Staff access required' });
+    }
+    const staffId = String(req.user.sub);
+    const items = await (prisma as any).booking.findMany({
+      where: { assignedStaffId: staffId },
+      orderBy: { updatedAt: 'desc' },
+      select: {
+        id: true,
+        projectType: true,
+        fullName: true,
+        city: true,
+        state: true,
+        country: true,
+        createdAt: true,
+        updatedAt: true,
+        steps: {
+          select: { id: true, name: true, completed: true, order: true, completedAt: true, completionNotes: true },
+          orderBy: { order: 'asc' },
+        },
+      },
+    });
+
+    res.json(items);
+  } catch (error) {
+    console.error('[staff-my-leads] Error:', error);
+    res.status(500).json({ error: 'An internal server error occurred' });
+  }
+});
+
+// Staff: get specific assigned booking details
+app.get('/api/staff/my-leads/:id', protect, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (req.user?.type !== 'staff') {
+      return res.status(403).json({ error: 'Forbidden: Staff access required' });
+    }
+    const staffId = String(req.user.sub);
+    const { id } = req.params;
+
+    const lead = await (prisma as any).booking.findFirst({
+      where: { 
+        id,
+        assignedStaffId: staffId 
+      },
+      include: {
+        customer: true,
+        steps: { 
+          select: { id: true, name: true, completed: true, order: true, completedAt: true, completionNotes: true },
+          orderBy: { order: 'asc' } 
+        },
+      },
+    });
+
+    if (!lead) {
+      return res.status(404).json({ error: 'Booking not found or not assigned to you' });
+    }
+
+    res.json(lead);
+  } catch (error) {
+    console.error('[staff-my-leads-detail] Error:', error);
+    res.status(500).json({ error: 'An internal server error occurred' });
+  }
+});
+
+// Staff: mark step as complete with notes
+app.post('/api/staff/steps/:stepId/complete', protect, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (req.user?.type !== 'staff') {
+      return res.status(403).json({ error: 'Forbidden: Staff access required' });
+    }
+    const staffId = String(req.user.sub);
+    const { stepId } = req.params;
+    const { notes } = req.body;
+
+    if (!notes || !notes.trim()) {
+      return res.status(400).json({ error: 'Completion notes are required' });
+    }
+
+    // First verify the step belongs to a booking assigned to this staff
+    const step = await (prisma as any).leadStep.findFirst({
+      where: { id: stepId },
+      include: {
+        lead: {
+          select: { id: true, assignedStaffId: true }
+        }
+      }
+    });
+
+    if (!step) {
+      return res.status(404).json({ error: 'Step not found' });
+    }
+
+    if (step.lead.assignedStaffId !== staffId) {
+      return res.status(403).json({ error: 'You are not assigned to this booking' });
+    }
+
+    if (step.completed) {
+      return res.status(400).json({ error: 'Step is already completed' });
+    }
+
+    // Update the step
+    const updatedStep = await (prisma as any).leadStep.update({
+      where: { id: stepId },
+      data: {
+        completed: true,
+        completedAt: new Date(),
+        completionNotes: notes.trim(),
+      },
+    });
+
+    // Update booking progress
+    const allSteps = await (prisma as any).leadStep.findMany({
+      where: { leadId: step.lead.id },
+      select: { completed: true }
+    });
+    
+    const completedSteps = allSteps.filter((s: any) => s.completed).length;
+    const totalSteps = allSteps.length;
+    const newPercent = Math.round((completedSteps / totalSteps) * 100);
+
+    await (prisma as any).booking.update({
+      where: { id: step.lead.id },
+      data: { percent: newPercent }
+    });
+
+    res.json({ 
+      success: true, 
+      step: updatedStep,
+      progress: { completed: completedSteps, total: totalSteps, percent: newPercent }
+    });
+  } catch (error) {
+    console.error('[staff-complete-step] Error:', error);
+    res.status(500).json({ error: 'An internal server error occurred' });
   }
 });
 
@@ -117,19 +448,7 @@ const OTP_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const OTP_MAX_ATTEMPTS = 5;
 import { JWT_SECRET } from './config.js';
 
-// Twilio toggle
-const TWILIO_ENABLED = String(process.env.TWILIO_ENABLED || 'false').toLowerCase() === 'true';
-// If true, when SMS sending fails we will fall back to returning the OTP in the response (DEV behavior).
-// In production set this to false to avoid exposing OTPs when Twilio fails.
-const ALLOW_DEV_OTP = String(process.env.ALLOW_DEV_OTP || 'false').toLowerCase() === 'true';
-
-function toE164(mobile: string, defaultCountry = '+91'): string {
-  const trimmed = (mobile || '').replace(/\s+/g, '');
-  if (!trimmed) return trimmed;
-  if (trimmed.startsWith('+')) return trimmed;
-  if (/^\d+$/.test(trimmed)) return `${defaultCountry}${trimmed}`;
-  return trimmed;
-}
+// Twilio removed; always console-output OTP in dev
 
 app.get('/api/health', (_req: Request, res: Response) => {
   res.json({ ok: true });
@@ -183,37 +502,177 @@ app.post('/api/leads', protect, async (req: AuthenticatedRequest, res: Response)
       return res.status(403).json({ error: 'Forbidden: customers only' });
     }
     const body = req.body ?? {};
-    const required = ['projectType','sizedKW','monthlyBill','pincode','brand','estimateINR','fullName','phone','address','street','state','city','country','zip'];
+    const required = ['projectType','sizedKW','monthlyBill','pincode','estimateINR','fullName','phone','address','street','state','city','country','zip'];
     for (const key of required) {
       if (body[key] === undefined || body[key] === null || body[key] === '') {
         return res.status(400).json({ error: `Missing required field: ${key}` });
       }
     }
-    const created = await (prisma as any).lead.create({
+    // Map optional calculator fields
+    const billingCycleMonths = typeof body.billingCycleMonths === 'number'
+      ? body.billingCycleMonths
+      : (body.billingCycle === '2m' ? 2 : 1);
+    const budgetINR = body.budget !== undefined ? Number(body.budget) : (body.budgetINR !== undefined ? Number(body.budgetINR) : null);
+    const provider = typeof body.provider === 'string' ? String(body.provider) : undefined;
+
+    // Finance/gst defaults
+    const gstPct = body.gstPct !== undefined && body.gstPct !== null && body.gstPct !== '' ? Number(body.gstPct) : 8.9;
+    const totalInvBase = body.totalInvestment !== undefined ? Number(body.totalInvestment) : Number(body.estimateINR);
+    const computedGstAmount = body.gstAmount !== undefined && body.gstAmount !== null && body.gstAmount !== ''
+      ? Number(body.gstAmount)
+      : Math.round((Number.isFinite(totalInvBase) ? totalInvBase : 0) * (gstPct / 100));
+
+    const Booking = (prisma as any).booking ?? (prisma as any).lead;
+    const created = await Booking.create({
       data: {
         customerId: req.user.sub,
         projectType: String(body.projectType),
         sizedKW: Number(body.sizedKW),
         monthlyBill: Number(body.monthlyBill),
+        // Allow pincode override from calculator if provided
         pincode: String(body.pincode),
-        brand: String(body.brand),
+        
         withSubsidy: body.withSubsidy === undefined ? true : Boolean(body.withSubsidy),
         estimateINR: Number(body.estimateINR),
+        totalInvestment: totalInvBase,
         wp: body.wp !== undefined ? Number(body.wp) : null,
         plates: body.plates !== undefined ? Number(body.plates) : null,
+        // Finance (receipt) inputs
+        ratePerKW: body.ratePerKW !== undefined ? Number(body.ratePerKW) : null,
+        networkChargePerUnit: body.networkChargePerUnit !== undefined ? Number(body.networkChargePerUnit) : null,
+        annualGenPerKW: body.annualGenPerKW !== undefined ? Number(body.annualGenPerKW) : null,
+        moduleDegradationPct: body.moduleDegradationPct !== undefined ? Number(body.moduleDegradationPct) : null,
+        omPerKWYear: body.omPerKWYear !== undefined ? Number(body.omPerKWYear) : null,
+        omEscalationPct: body.omEscalationPct !== undefined ? Number(body.omEscalationPct) : null,
+        tariffINR: body.tariffINR !== undefined ? Number(body.tariffINR) : null,
+        tariffEscalationPct: body.tariffEscalationPct !== undefined ? Number(body.tariffEscalationPct) : null,
+        lifeYears: body.lifeYears !== undefined ? Number(body.lifeYears) : null,
+        gstPct,
+        gstAmount: computedGstAmount,
         fullName: String(body.fullName),
         phone: String(body.phone),
+        email: body.email ? String(body.email) : null,
         address: String(body.address),
         street: String(body.street),
         state: String(body.state),
         city: String(body.city),
         country: String(body.country),
         zip: String(body.zip),
+        // New optional calculator-derived fields
+        billingCycleMonths,
+        budgetINR,
+        ...(provider ? { provider } : {}),
       }
     });
     res.status(201).json(created);
-  } catch (err) {
-    console.error('[leads] create failed', err);
+  } catch (err: any) {
+    console.error('[leads] create failed', err?.message || err, err?.stack);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Public create lead/booking (no auth) - used by mobile app 5/5 submission
+app.post('/api/leads/public', async (req: Request, res: Response) => {
+  try {
+    const body = req.body ?? {};
+    const required = ['projectType','sizedKW','monthlyBill','pincode','estimateINR','fullName','phone','address','street','state','city','country','zip'];
+    for (const key of required) {
+      if (body[key] === undefined || body[key] === null || body[key] === '') {
+        return res.status(400).json({ error: `Missing required field: ${key}` });
+      }
+    }
+    const billingCycleMonths = typeof body.billingCycleMonths === 'number'
+      ? body.billingCycleMonths
+      : (body.billingCycle === '2m' ? 2 : 1);
+    const budgetINR = body.budget !== undefined ? Number(body.budget) : (body.budgetINR !== undefined ? Number(body.budgetINR) : null);
+    const provider = typeof body.provider === 'string' ? body.provider : null;
+
+    // Finance/gst defaults for public route
+    const gstPctPublic = body.gstPct !== undefined && body.gstPct !== null && body.gstPct !== '' ? Number(body.gstPct) : 8.9;
+    const totalInvBasePublic = body.totalInvestment !== undefined ? Number(body.totalInvestment) : Number(body.estimateINR);
+    const computedGstAmountPublic = body.gstAmount !== undefined && body.gstAmount !== null && body.gstAmount !== ''
+      ? Number(body.gstAmount)
+      : Math.round((Number.isFinite(totalInvBasePublic) ? totalInvBasePublic : 0) * (gstPctPublic / 100));
+
+    // If a valid customer token is present, associate this booking to that customer
+    let customerId: string | null = null;
+    try {
+      const auth = String(req.headers['authorization'] || '');
+      const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+      if (token) {
+        const decoded: any = jwt.verify(token, JWT_SECRET);
+        if (decoded && decoded.type === 'customer' && typeof decoded.sub === 'string') {
+          customerId = decoded.sub;
+        }
+      }
+    } catch {
+      // ignore auth errors in public route
+    }
+
+    // If no token-derived customer, try to infer from provided phone/mobile
+    if (!customerId) {
+      try {
+        const rawPhone: string | undefined = typeof body.phone === 'string' ? body.phone : (typeof body.mobile === 'string' ? body.mobile : undefined);
+        if (rawPhone) {
+          const normalized = String(rawPhone).replace(/\D+/g, ''); // digits only
+          if (normalized.length >= 8 && normalized.length <= 15) {
+            const existing = await (prisma as any).customer.findUnique({ where: { mobile: normalized } });
+            if (existing) {
+              customerId = existing.id;
+            } else {
+              const createdCustomer = await (prisma as any).customer.create({ data: { mobile: normalized } });
+              customerId = createdCustomer.id;
+            }
+          }
+        }
+      } catch (e) {
+        // do not fail public route due to customer association issues
+        console.warn('[leads-public] customer association by phone skipped:', (e as any)?.message || e);
+      }
+    }
+
+    const Booking = (prisma as any).booking ?? (prisma as any).lead ?? (prisma as any).Lead;
+    const created = await Booking.create({
+      data: {
+        ...(customerId ? { customerId } : {}),
+        projectType: String(body.projectType),
+        sizedKW: Number(body.sizedKW),
+        monthlyBill: Number(body.monthlyBill),
+        pincode: String(body.pincode),
+        withSubsidy: body.withSubsidy === undefined ? true : Boolean(body.withSubsidy),
+        estimateINR: Number(body.estimateINR),
+        totalInvestment: totalInvBasePublic,
+        wp: body.wp !== undefined ? Number(body.wp) : null,
+        plates: body.plates !== undefined ? Number(body.plates) : null,
+        // Finance (receipt) inputs
+        ratePerKW: body.ratePerKW !== undefined ? Number(body.ratePerKW) : null,
+        networkChargePerUnit: body.networkChargePerUnit !== undefined ? Number(body.networkChargePerUnit) : null,
+        annualGenPerKW: body.annualGenPerKW !== undefined ? Number(body.annualGenPerKW) : null,
+        moduleDegradationPct: body.moduleDegradationPct !== undefined ? Number(body.moduleDegradationPct) : null,
+        omPerKWYear: body.omPerKWYear !== undefined ? Number(body.omPerKWYear) : null,
+        omEscalationPct: body.omEscalationPct !== undefined ? Number(body.omEscalationPct) : null,
+        tariffINR: body.tariffINR !== undefined ? Number(body.tariffINR) : null,
+        tariffEscalationPct: body.tariffEscalationPct !== undefined ? Number(body.tariffEscalationPct) : null,
+        lifeYears: body.lifeYears !== undefined ? Number(body.lifeYears) : null,
+        gstPct: gstPctPublic,
+        gstAmount: computedGstAmountPublic,
+        fullName: String(body.fullName),
+        phone: String(body.phone),
+        email: body.email ? String(body.email) : null,
+        address: String(body.address),
+        street: String(body.street),
+        state: String(body.state),
+        city: String(body.city),
+        country: String(body.country),
+        zip: String(body.zip),
+        billingCycleMonths,
+        budgetINR,
+        ...(provider ? { provider } : {}),
+      }
+    });
+    res.status(201).json(created);
+  } catch (err: any) {
+    console.error('[leads-public] create failed', err?.message || err, err?.stack);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
@@ -222,7 +681,7 @@ app.post('/api/leads', protect, async (req: AuthenticatedRequest, res: Response)
 app.get('/api/customer/leads', protect, async (req: AuthenticatedRequest, res: Response) => {
   try {
     if (req.user?.type !== 'customer') return res.status(403).json({ error: 'Forbidden' });
-    const items = await (prisma as any).lead.findMany({ where: { customerId: req.user.sub }, orderBy: { createdAt: 'desc' } });
+    const items = await (prisma as any).booking.findMany({ where: { customerId: req.user.sub }, orderBy: { createdAt: 'desc' } });
     const withSigned = await Promise.all(items.map(async (l: any) => ({
       ...l,
       certificateUrl: typeof l.certificateUrl === 'string' ? await signIfS3Url(l.certificateUrl) : l.certificateUrl,
@@ -239,7 +698,7 @@ app.get('/api/customer/leads/:id', protect, async (req: AuthenticatedRequest, re
   try {
     if (req.user?.type !== 'customer') return res.status(403).json({ error: 'Forbidden' });
     const { id } = req.params;
-    const lead = await (prisma as any).lead.findFirst({ where: { id, customerId: req.user.sub } });
+    const lead = await (prisma as any).booking.findFirst({ where: { id, customerId: req.user.sub } });
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
     const signed = { ...lead, certificateUrl: typeof lead.certificateUrl === 'string' ? await signIfS3Url(lead.certificateUrl) : lead.certificateUrl };
     res.json(signed);
@@ -253,7 +712,20 @@ app.get('/api/customer/leads/:id', protect, async (req: AuthenticatedRequest, re
 app.get('/api/admin/leads', protect, async (req: AuthenticatedRequest, res: Response) => {
   try {
     if (req.user?.type !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-    const items = await (prisma as any).lead.findMany({ orderBy: { createdAt: 'desc' }, include: { customer: true } });
+    const items = await (prisma as any).booking.findMany({ 
+      orderBy: { createdAt: 'desc' }, 
+      include: { 
+        customer: true, 
+        steps: true,
+        assignedStaff: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+          },
+        },
+      } 
+    });
     const withSigned = await Promise.all(items.map(async (l: any) => ({
       ...l,
       certificateUrl: typeof l.certificateUrl === 'string' ? await signIfS3Url(l.certificateUrl) : l.certificateUrl,
@@ -285,7 +757,21 @@ app.get('/api/admin/leads/:id', protect, async (req: AuthenticatedRequest, res: 
   try {
     if (req.user?.type !== 'admin') return res.status(403).json({ error: 'Forbidden' });
     const { id } = req.params;
-    const lead = await (prisma as any).lead.findUnique({ where: { id }, include: { customer: true, steps: { orderBy: { order: 'asc' } } } });
+    const lead = await (prisma as any).booking.findUnique({ 
+      where: { id }, 
+      include: { 
+        customer: true, 
+        steps: { orderBy: { order: 'asc' } },
+        assignedStaff: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            phone: true,
+          },
+        },
+      } 
+    });
     if (!lead) return res.status(404).json({ error: 'Not found' });
     const signed = { ...lead, certificateUrl: typeof lead.certificateUrl === 'string' ? await signIfS3Url(lead.certificateUrl) : lead.certificateUrl };
     res.json(signed);
@@ -371,7 +857,7 @@ app.patch('/api/admin/leads/:id/steps/:stepId', protect, async (req: Authenticat
               location,
               certificateId,
             });
-            await (prisma as any).lead.update({
+            await (prisma as any).booking.update({
               where: { id },
               data: { certificateUrl: publicUrl, certificateGeneratedAt: new Date() },
             });
@@ -404,8 +890,12 @@ app.get('/api/customer/leads/:id/steps', protect, async (req: AuthenticatedReque
   try {
     if (req.user?.type !== 'customer') return res.status(403).json({ error: 'Forbidden' });
     const { id } = req.params;
-    const lead = await (prisma as any).lead.findFirst({ where: { id, customerId: req.user.sub } });
-    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    // Some environments use `booking` instead of `lead`
+    let ownerLead: any = await (prisma as any).booking.findFirst({ where: { id, customerId: req.user.sub } });
+    if (!ownerLead && (prisma as any).lead && typeof (prisma as any).lead.findFirst === 'function') {
+      ownerLead = await (prisma as any).lead.findFirst({ where: { id, customerId: req.user.sub } });
+    }
+    if (!ownerLead) return res.status(404).json({ error: 'Lead not found' });
     const existing: any[] = await (prisma as any).leadStep.findMany({ where: { leadId: id }, orderBy: { order: 'asc' } });
     if (existing.length === 0) {
       await (prisma as any).$transaction(
@@ -426,7 +916,7 @@ app.post('/api/customer/amc-requests', protect, async (req: AuthenticatedRequest
     if (req.user?.type !== 'customer') return res.status(403).json({ error: 'Forbidden' });
     const { leadId, note } = req.body ?? {};
     if (!leadId) return res.status(400).json({ error: 'leadId is required' });
-    const lead = await (prisma as any).lead.findFirst({ where: { id: String(leadId), customerId: req.user.sub } });
+    const lead = await (prisma as any).booking.findFirst({ where: { id: String(leadId), customerId: req.user.sub } });
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
     let existing = await (prisma as any).amcRequest.findFirst({
       where: { leadId: String(leadId), customerId: req.user.sub, NOT: { status: 'resolved' } },
@@ -459,7 +949,7 @@ app.get('/api/customer/amc-requests', protect, async (req: AuthenticatedRequest,
     if (req.user?.type !== 'customer') return res.status(403).json({ error: 'Forbidden' });
     const leadId = String((req.query as any).leadId || '');
     if (!leadId) return res.status(400).json({ error: 'leadId query is required' });
-    const lead = await (prisma as any).lead.findFirst({ where: { id: leadId, customerId: req.user.sub } });
+    const lead = await (prisma as any).booking.findFirst({ where: { id: leadId, customerId: req.user.sub } });
     if (!lead) return res.json(null);
     const reqItem = await (prisma as any).amcRequest.findFirst({
       where: { leadId, customerId: req.user.sub },
@@ -537,20 +1027,8 @@ app.post('/api/auth/partner/request-otp', async (req: Request, res: Response) =>
   const normalizedMobile = `+91${mobile}`;
   const otp = Math.floor(100000 + Math.random() * 900000).toString();
   otpStore.set(normalizedMobile, { code: otp, expiresAt: Date.now() + OTP_TTL_MS, attempts: 0 });
-  try {
-    if (TWILIO_ENABLED) {
-      const phone = toE164(normalizedMobile);
-      await sendOTP(phone, otp);
-      return res.json({ message: 'OTP sent via SMS' });
-    }
-  } catch (err) {
-    console.error('[twilio][partner] send failed, falling back to dev OTP response', err);
-    if (!ALLOW_DEV_OTP) {
-      return res.status(502).json({ error: 'Failed to send OTP via SMS. Please try again later.' });
-    }
-  }
   console.log(`[request-otp-partner][DEV] OTP for ${normalizedMobile} is ${otp}`);
-  return res.json({ message: 'OTP sent (DEV)', otp });
+  return res.json({ message: 'OTP sent (DEV)', otp, ttlMs: OTP_TTL_MS });
 });
 
 app.post('/api/auth/partner/verify-otp', async (req: Request, res: Response) => {
@@ -641,19 +1119,7 @@ app.post('/api/auth/request-otp', async (req: Request, res: Response) => {
       attempts: 0,
     });
 
-    // Try Twilio if enabled; otherwise return in response for dev
-    try {
-      if (TWILIO_ENABLED) {
-        const phone = toE164(normalized);
-        await sendOTP(phone, code);
-        return res.json({ success: true, mobile: phone, ttlMs: OTP_TTL_MS, via: 'sms' });
-      }
-    } catch (err) {
-      console.error('[twilio][customer] send failed, falling back to dev OTP response', err);
-      if (!ALLOW_DEV_OTP) {
-        return res.status(502).json({ error: 'Failed to send OTP via SMS. Please try again later.' });
-      }
-    }
+    console.log(`[request-otp][DEV] OTP for ${normalized} is ${code}`);
     return res.json({ success: true, mobile: normalized, otp: code, ttlMs: OTP_TTL_MS, via: 'dev' });
   } catch (err) {
     // eslint-disable-next-line no-console

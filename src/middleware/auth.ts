@@ -5,8 +5,8 @@ import { JWT_SECRET } from '../config.js';
 // A flexible payload that can handle all user types
 interface UserPayload {
   sub: string;
-  type: 'customer' | 'partner' | 'admin';
-  mobile?: string; // Optional for admin
+  type: 'customer' | 'partner' | 'admin' | 'staff';
+  mobile?: string; // Optional for admin/staff
   email?: string;  // Optional for customer/partner
   iat: number;
   exp: number;
@@ -16,7 +16,7 @@ interface UserPayload {
 export interface AuthenticatedRequest extends Request {
   user?: {
     sub: string;
-    type: 'customer' | 'partner' | 'admin';
+    type: 'customer' | 'partner' | 'admin' | 'staff';
     mobile?: string;
     email?: string;
   };

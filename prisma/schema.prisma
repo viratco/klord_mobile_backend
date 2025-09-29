@@ -17,7 +17,7 @@ model AmcRequest {
   updatedAt  DateTime  @updatedAt
   resolvedAt DateTime?
   customer   Customer  @relation(fields: [customerId], references: [id])
-  lead       Lead      @relation(fields: [leadId], references: [id])
+  lead       Booking   @relation(fields: [leadId], references: [id])
 
   @@index([leadId])
   @@index([customerId])
@@ -29,7 +29,7 @@ model Customer {
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
   amcRequests AmcRequest[]
-  leads       Lead[]
+  leads       Booking[]
 }
 
 model Partner {
@@ -52,6 +52,17 @@ model Admin {
   posts        Post[]
 }
 
+model Staff {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  name         String
+  phone        String?
+  passwordHash String
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  assignedBookings Booking[] @relation("StaffBookings")
+}
+
 model Post {
   id        String   @id @default(cuid())
   caption   String
@@ -63,26 +74,47 @@ model Post {
   author    Admin?   @relation(fields: [authorId], references: [id])
 }
 
-model Lead {
+model Booking {
   id                     String       @id @default(cuid())
   customerId             String?
   projectType            String
   sizedKW                Float
   monthlyBill            Int
+  billingCycleMonths     Int           @default(1) // 1 or 2
   pincode                String
-  brand                  String
+  provider               PanelProvider?
+  budgetINR              Int?
   withSubsidy            Boolean      @default(true)
   estimateINR            Int
   wp                     Int?
   plates                 Int?
+  // Finance (receipt) inputs from 4/5
+  ratePerKW              Float?
+  networkChargePerUnit   Float?
+  annualGenPerKW         Float?
+  moduleDegradationPct   Float?
+  omPerKWYear            Float?
+  omEscalationPct        Float?
+  tariffINR              Float?
+  tariffEscalationPct    Float?
+  lifeYears              Int?
+  gstPct                 Float?
+  gstAmount              Int?
+  totalInvestment        Int?
   fullName               String
   phone                  String
+  email                  String?
   address                String
   street                 String
   state                  String
   city                   String
   country                String
   zip                    String
+  // Assignment
+  assigned               Boolean      @default(false)
+  assignedStaffId        String?
+  assignedStaff          Staff?       @relation("StaffBookings", fields: [assignedStaffId], references: [id])
+  percent                Int          @default(0)
   createdAt              DateTime     @default(now())
   updatedAt              DateTime     @updatedAt
   certificateUrl         String?
@@ -92,19 +124,22 @@ model Lead {
   steps                  LeadStep[]
 
   @@index([customerId])
+  @@index([assignedStaffId])
   @@index([pincode])
+  @@map("Lead")
 }
 
 model LeadStep {
-  id          String    @id @default(cuid())
-  leadId      String
-  name        String
-  order       Int
-  completed   Boolean   @default(false)
-  completedAt DateTime?
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
-  lead        Lead      @relation(fields: [leadId], references: [id])
+  id               String    @id @default(cuid())
+  leadId           String
+  name             String
+  order            Int
+  completed        Boolean   @default(false)
+  completedAt      DateTime?
+  completionNotes  String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  lead             Booking   @relation(fields: [leadId], references: [id])
 
   @@unique([leadId, order])
   @@index([leadId])
@@ -115,4 +150,15 @@ enum AmcStatus {
   in_progress
   resolved
   rejected
+}
+
+
+enum PanelProvider {
+  waare
+  tata
+  satvik
+  rayzon
+  navitas
+  pahal
+  vikram
 }
